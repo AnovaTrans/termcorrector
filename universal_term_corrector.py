@@ -39,6 +39,7 @@ import time
 from xml.dom import minidom
 import copy
 import html
+import difflib
 import tempfile
 import shutil
 import sys
@@ -282,8 +283,40 @@ def enhanced_xml_reconstruction(target_text: str, corrections: List[Tuple[str, s
         except Exception as e:
             print(f"❌ Error replacing '{old_term}' with '{new_term}': {e}")
             continue
-    
+
     return result
+
+
+def derive_surface_replacements(before: str, after: str) -> List[Tuple[str, str]]:
+    """Word-level (old -> new) pairs that turn `before` into `after`.
+
+    The AI returns the full corrected target; the only differences are the
+    target-language surface forms of the term (e.g. şoförün -> sürücünün). We
+    diff at the word level and keep only the changed spans, so those — and only
+    those — can be applied to the raw (tagged/escaped) target, leaving tags,
+    entities, whitespace and placeholders untouched. This is what actually
+    writes the AI's correction to the file; the old code searched the target
+    for the English *source* term, which is not present, so nothing was written.
+    """
+    a, b = before.split(), after.split()
+    pairs: List[Tuple[str, str]] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "replace":
+            old, new = " ".join(a[i1:i2]), " ".join(b[j1:j2])
+            if old and new and old != new:
+                pairs.append((old, new))
+    # Longest source first so 'şoförün' is replaced before the substring 'şoför'.
+    pairs.sort(key=lambda p: len(p[0]), reverse=True)
+    return pairs
+
+
+def apply_surface_replacements(raw_target: str, pairs: List[Tuple[str, str]]) -> str:
+    """Apply target-side surface replacements to the raw target text."""
+    out = raw_target
+    for old, new in pairs:
+        out = out.replace(old, new)
+    return out
+
 
 @dataclass
 class TermCorrection:
@@ -1050,6 +1083,7 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
             unit_corrections = []
             unit_semantic_analyses = []
             corrections_to_apply = []
+            unit_surface_pairs: List[Tuple[str, str]] = []
             
             for term_correction in self.term_corrections:
                 if self.find_advanced_term_matches(source_analysis, term_correction.source_term):
@@ -1076,6 +1110,11 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
                     
                     # Track corrections to apply
                     corrections_to_apply.append((term_correction.source_term, term_correction.target_term))
+                    # The AI already produced the correct target; capture only the
+                    # changed target-side surface forms so we write THOSE to the file.
+                    unit_surface_pairs.extend(
+                        derive_surface_replacements(target_analysis, corrected_text)
+                    )
                     
                     # Calculate quality metrics
                     quality_metrics = semantic_analysis.get("replacement_quality", {})
@@ -1103,32 +1142,18 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
                     correction_results.append(result)
             
             # Apply all corrections for this unit if any were found
-            if corrections_to_apply:
-                # Apply format-specific correction approach
+            if corrections_to_apply and unit_surface_pairs:
+                # Write the AI's ACTUAL correction: apply only the changed
+                # target-side surface forms to the raw target, preserving tags,
+                # entities and placeholders. The old code searched the target for
+                # the English source term, which is not there, so nothing was
+                # written — hence "13 found, 1 applied".
+                new_target_content = apply_surface_replacements(target_text, unit_surface_pairs)
                 if self.file_format_info.format_type == "mqxliff":
-                    # MemoQ XLIFF requires special handling to preserve structure
-                    new_target_content = enhanced_xml_reconstruction(
-                        target_text, 
-                        corrections_to_apply,
-                        format_type="mqxliff"
-                    )
                     self.processing_stats['memoq_metadata_preserved'] += 1
                 elif self.file_format_info.format_type == "sdlxliff":
-                    # SDL XLIFF: preserve mrk structure and SDL metadata
-                    new_target_content = enhanced_xml_reconstruction(
-                        target_text, 
-                        corrections_to_apply,
-                        format_type="sdlxliff"
-                    )
                     self.processing_stats['sdl_metadata_preserved'] += 1
-                else:
-                    # Standard XLIFF: use enhanced XML reconstruction
-                    new_target_content = enhanced_xml_reconstruction(
-                        target_text, 
-                        corrections_to_apply,
-                        format_type="generic"
-                    )
-                
+
                 # Verify changes and update target
                 if new_target_content != target_text:
                     # Replace the target in the translation unit
@@ -1291,7 +1316,7 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
                 "timestamp": timestamp,
                 "source_file": file_path,
                 "processing_version": "Universal FORCE MODE Professional Edition v4.2",
-                "ai_model": "claude-3-5-sonnet-20241022",
+                "ai_model": self.model,
                 "force_mode": True,
                 "universal_format_support": True
             },
