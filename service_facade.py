@@ -64,6 +64,7 @@ class TermEngineService:
         mode: str = "ai_evaluated",  # "ai_evaluated" | "forced"
         lang_pair: Optional[Tuple[str, str]] = None,
         progress_callbacks: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,  # UI-selected current model id
     ) -> Dict[str, Any]:
         """
         Ana giriş noktası.
@@ -99,7 +100,7 @@ class TermEngineService:
             if force_mode:
                 # Forced → robust DOM engine: format-aware, always enforces, and
                 # process_xliff_file writes the corrected file back to tmp_path.
-                corrector = UniversalTermCorrectorForce(api_key=self.api_key)
+                corrector = UniversalTermCorrectorForce(api_key=self.api_key, model=model)
                 corrector.term_corrections = [
                     ForceTermCorrection(**t.to_term_correction_payload()) for t in terms
                 ]
@@ -112,6 +113,7 @@ class TermEngineService:
                 corrector = UltimateTermCorrectorV8(
                     api_key=self.api_key,
                     force_mode=False,
+                    model=model,
                 )
                 if lang_pair is not None:
                     src_lang, tgt_lang = lang_pair

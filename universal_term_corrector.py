@@ -323,9 +323,10 @@ class FileFormatInfo:
 class UniversalTermCorrectorForce:
     """Ultimate multilingual term corrector with universal format support"""
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "claude-opus-5"):
         """Initialize the ultimate corrector with universal format capabilities"""
         self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = model or "claude-opus-5"  # UI-selected current model
         self.term_corrections: List[TermCorrection] = []
         self.morphological_groups: Dict[str, List[TermCorrection]] = defaultdict(list)
         self.correction_results: List[CorrectionResult] = []
@@ -793,9 +794,8 @@ Focus on providing the highest quality linguistic replacement possible."""
 
         try:
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model=self.model,
                 max_tokens=3000,
-                temperature=0,
                 system=f"You are an expert {source_lang_name}-{target_lang_name} linguist. Provide expert analysis for optimal term replacement. The correction WILL be made - focus on making it perfect.",
                 messages=[{"role": "user", "content": force_semantic_prompt}]
             )
@@ -901,9 +901,8 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
 
         try:
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model=self.model,
                 max_tokens=2000,
-                temperature=0,
                 system=f"You are the world's leading {source_lang_name}-{target_lang_name} linguistic expert. Make perfect term corrections with absolute grammatical accuracy and natural fluency.",
                 messages=[{"role": "user", "content": expert_replacement_prompt}]
             )

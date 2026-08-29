@@ -75,16 +75,17 @@ class ProcessingResult:
 # --- CORE INTELLIGENCE AND UTILITY CLASSES ---
 
 class IntelligentModelSystem:
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, pinned_model: Optional[str] = None):
         self.config = self._load_config(config_path)
         self.performance_stats: Dict[str, ModelPerformance] = {}
-        self.current_model: Optional[str] = None
+        self.pinned_model = pinned_model  # UI-selected current model; bypasses discovery
+        self.current_model: Optional[str] = pinned_model
         self.last_discovery: Optional[datetime] = None
         self.discovery_interval = 24 * 3600
 
     def _load_config(self, config_path: Optional[str]) -> Dict:
         default_config = {
-            "model_hierarchy": ["claude-3-5-sonnet-20240620", "claude-3-opus-20240229"],
+            "model_hierarchy": ["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5"],
             "auto_update": True, "fallback_strategy": "graceful"
         }
         if config_path and os.path.exists(config_path):
@@ -92,6 +93,8 @@ class IntelligentModelSystem:
         return default_config
 
     def get_best_model(self, client: anthropic.Anthropic) -> str:
+        if self.pinned_model:
+            return self.pinned_model
         time_since = (datetime.now() - self.last_discovery).total_seconds() if self.last_discovery else self.discovery_interval + 1
         if not self.current_model or time_since > self.discovery_interval:
             self.current_model = self._discover_best_model(client)
@@ -111,7 +114,10 @@ class IntelligentModelSystem:
     
     def resilient_api_call(self, client: anthropic.Anthropic, **kwargs) -> Any:
         max_retries, last_exception = 3, None
-        models_to_try = [self.get_best_model(client)] + [m for m in self.config["model_hierarchy"] if m != self.current_model]
+        if self.pinned_model:
+            models_to_try = [self.pinned_model]
+        else:
+            models_to_try = [self.get_best_model(client)] + [m for m in self.config["model_hierarchy"] if m != self.current_model]
         for attempt in range(max_retries):
             for model_name in models_to_try:
                 try:
@@ -184,7 +190,7 @@ class BatchProcessor:
 
     def _process_single_batch(self, batch_segments: List[Dict], term_corrections: List[TermCorrection], client: anthropic.Anthropic, logger: logging.Logger) -> List[ProcessingResult]:
         batch_prompt = self._create_batch_prompt(batch_segments, term_corrections)
-        response = self.model_system.resilient_api_call(client, max_tokens=4000, temperature=0, system="You are an expert multilingual term correction system.", messages=[{"role": "user", "content": batch_prompt}])
+        response = self.model_system.resilient_api_call(client, max_tokens=4000, system="You are an expert multilingual term correction system.", messages=[{"role": "user", "content": batch_prompt}])
         return self._parse_batch_response(response.content[0].text, batch_segments, logger)
         
     def _create_batch_prompt(self, segments: List[Dict], term_corrections: List[TermCorrection]) -> str:
@@ -227,9 +233,9 @@ RETURN FORMAT (a single valid JSON object):
 # --- MAIN APPLICATION CLASS ---
 
 class UltimateTermCorrectorV8:
-    def __init__(self, api_key: str, force_mode: bool = False):
+    def __init__(self, api_key: str, force_mode: bool = False, model: Optional[str] = None):
         self.client, self.force_mode = anthropic.Anthropic(api_key=api_key), force_mode
-        self.model_system, self.cache = IntelligentModelSystem(), SmartCache()
+        self.model_system, self.cache = IntelligentModelSystem(pinned_model=model), SmartCache()
         self.batch_processor = BatchProcessor(self.model_system, self.cache, force_mode=self.force_mode)
         self.format_detector, self.term_corrections, self.processing_stats = UniversalFormatDetector(), [], defaultdict(int)
         self.language_names = {'en': 'English', 'de': 'German', 'bg': 'Bulgarian', 'ro': 'Romanian', 'tr': 'Turkish', 'es': 'Spanish', 'fr': 'French', 'it': 'Italian'}
@@ -247,7 +253,7 @@ class UltimateTermCorrectorV8:
         lang_name = self.language_names.get(term.source_language, term.source_language)
         prompt = f"""Given the word in {lang_name}: "{term.source_term}", provide a JSON list of its common morphological variants (e.g., plural, definite). Include the original word. Example: ["house", "houses"]. Return ONLY the JSON list."""
         try:
-            response = self.model_system.resilient_api_call(self.client, max_tokens=200, temperature=0.1, system="You are a linguistic expert.", messages=[{"role": "user", "content": prompt}])
+            response = self.model_system.resilient_api_call(self.client, max_tokens=200, system="You are a linguistic expert.", messages=[{"role": "user", "content": prompt}])
             json_match = re.search(r'\[[\s\S]*?\]', response.content[0].text)
             if json_match:
                 variants = json.loads(json_match.group(0))
