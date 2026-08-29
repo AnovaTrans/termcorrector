@@ -41,10 +41,14 @@ class UniversalTerm:
         target_lang: str,
         description: str = "",
         domain: str = "",
+        current_target_term: str = "",
     ) -> "UniversalTerm":
         """
         Streamlit arayüzünden gelen basit source/target çiftlerini
         UniversalTerm nesnesine dönüştürmek için yardımcı metod.
+
+        current_target_term (opsiyonel): hedefte ŞU AN geçen terim (örn. "şoför").
+        Verilirse motor deterministik + form-koruyan yolu kullanır.
         """
         return cls(
             id=idx,
@@ -54,6 +58,7 @@ class UniversalTerm:
             lemma_target=(target_term or "").strip(),
             description=(description or "").strip(),
             domain=(domain or "").strip(),
+            metadata={"current_target": (current_target_term or "").strip()},
         )
 
     def to_term_correction_payload(self) -> Dict[str, Any]:
@@ -68,8 +73,7 @@ class UniversalTerm:
             "source_language": self.source_language,
             "target_language": self.target_language,
             "description": self.description,
-            # TermCorrection'da 'variants' alanı yok ama ileride eklemek istersek
-            # target_variants'ı burada kullanabiliriz. Şimdilik sadece temel alanlar.
+            "current_target_term": self.metadata.get("current_target", ""),
         }
 
     def add_source_variant(self, form: str) -> None:

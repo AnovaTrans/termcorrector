@@ -56,6 +56,7 @@ class TermCorrection:
     target_language: str
     description: str = ""
     term_id: int = 0
+    current_target_term: str = ""  # optional: the term as it CURRENTLY appears in the target
     variants: List[str] = field(default_factory=list)
 
 @dataclass
