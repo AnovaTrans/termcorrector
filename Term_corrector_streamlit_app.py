@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import csv
 import html
+import io
+import json
 import logging
 import os
 import re
@@ -737,6 +740,49 @@ def apply_user_edits(file_bytes: bytes, edits: Dict[Any, str]) -> bytes:
     return text.encode("utf-8")
 
 
+def _auto_height(text: str) -> int:
+    """Editor height that fits the content (short → small box, long → taller)."""
+    lines = text.count("\n") + max(1, (len(text) // 90) + 1)
+    return int(min(max(lines * 24 + 20, 70), 480))
+
+
+def _final_target(unit_id: Any, auto_new: str, edits: Dict[Any, str]) -> str:
+    return edits.get(unit_id, edits.get(str(unit_id), auto_new))
+
+
+def _build_log(result: Dict, edits: Dict[Any, str], file_name: str) -> Dict:
+    counts = result.get("counts") or {}
+    segments = []
+    for r in result.get("results") or []:
+        uid, src, orig, auto_new = _result_fields(r)
+        final = _final_target(uid, auto_new, edits)
+        segments.append({
+            "unit_id": uid,
+            "source": src,
+            "original_target": orig,
+            "auto_new_target": auto_new,
+            "final_target": final,
+            "edited_by_user": final != auto_new,
+        })
+    return {
+        "file": file_name,
+        "counts": {k: counts.get(k) for k in
+                   ("segments_found", "instances_found", "segments_corrected", "instances_corrected")},
+        "unmapped_forms": counts.get("unmapped_forms", []),
+        "segments": segments,
+    }
+
+
+def _log_csv(log: Dict) -> bytes:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["unit_id", "source", "original_target", "final_target", "edited_by_user"])
+    for s in log["segments"]:
+        w.writerow([s["unit_id"], s["source"], s["original_target"],
+                    s["final_target"], s["edited_by_user"]])
+    return buf.getvalue().encode("utf-8-sig")  # BOM so Excel reads UTF-8
+
+
 def tab_results() -> None:
     st.header("4️⃣ Results & Download")
 
@@ -769,8 +815,8 @@ def tab_results() -> None:
     if detailed_results:
         st.subheader("Corrected segments (editable)")
         st.caption(
-            "Edit a New target and press Enter to save it. Edited segments are "
-            "included when you Save & Download."
+            "Edit a New target (the box auto-sizes to its content); click away or "
+            "press Ctrl+Enter to save. Edited segments are included in Save & Download."
         )
         for i, r in enumerate(detailed_results):
             unit_id, src, orig_tgt, new_tgt = _result_fields(r)
@@ -779,7 +825,10 @@ def tab_results() -> None:
             st.text(src)
             st.markdown("Original target:")
             st.text(orig_tgt)
-            edited = st.text_input("New target", value=new_tgt, key=f"edit_{i}_{unit_id}")
+            edited = st.text_area(
+                "New target", value=new_tgt, key=f"edit_{i}_{unit_id}",
+                height=_auto_height(new_tgt),
+            )
             if edited != new_tgt:
                 edits[unit_id] = edited
                 st.caption("✏️ edited — will be saved on download")
@@ -805,6 +854,25 @@ def tab_results() -> None:
                 file_name=f"corrected_{out_name}",
                 mime="application/xml",
             )
+
+    # Correction log — built in-memory from the results + your edits (works on
+    # Streamlit Cloud, where the engine's on-disk report is ephemeral).
+    if detailed_results:
+        log = _build_log(result, edits, st.session_state.file_name or "file")
+        base = (st.session_state.file_name or "corrections").rsplit(".", 1)[0]
+        lc1, lc2 = st.columns(2)
+        lc1.download_button(
+            "⬇️ Download log (JSON)",
+            data=json.dumps(log, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"{base}_log.json",
+            mime="application/json",
+        )
+        lc2.download_button(
+            "⬇️ Download log (CSV)",
+            data=_log_csv(log),
+            file_name=f"{base}_log.csv",
+            mime="text/csv",
+        )
 
 
 # ---------------------------------------------------------------------------
