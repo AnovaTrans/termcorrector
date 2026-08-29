@@ -258,6 +258,7 @@ def sidebar_configuration() -> Tuple[str, bool]:
     mode_label = st.sidebar.radio(
         "Correction Mode",
         ["AI-evaluated (context-aware)", "Forced (strict term enforcement)"],
+        index=1,  # default to Forced: enforce the given terms out of the box
         help=(
             "AI-evaluated mode can sometimes skip changes if they are semantically wrong. "
             "Forced mode always enforces the specified terms."
