@@ -370,17 +370,24 @@ def tab_terms() -> None:
     st.header("2️⃣ Term List")
 
     st.markdown(
-        "Define source/target term pairs here. "
-        "These will be enforced/corrected in the file, context-aware."
+        "Define terms to enforce in the file. Optionally give the **current** target "
+        "term (how it appears in the translation now) — then the tool locates it "
+        "directly and swaps only the word, keeping its grammatical form and case."
     )
 
     # Term input form
     with st.form("add_term_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
-            source_term = st.text_input("Source term")
+            source_term = st.text_input("Source term", help="e.g. driver")
         with col2:
-            target_term = st.text_input("Target term")
+            current_target_term = st.text_input(
+                "Current target term (optional)",
+                help="How the term appears in the translation now, e.g. şoför. "
+                "If given, the tool is far more accurate.",
+            )
+        with col3:
+            target_term = st.text_input("Desired target term", help="e.g. sürücü")
 
         description = st.text_input("Description (optional)")
         submitted = st.form_submit_button("➕ Add term")
@@ -391,12 +398,13 @@ def tab_terms() -> None:
         if not ok_s:
             st.error(f"Invalid source term: {msg_s}")
         elif not ok_t:
-            st.error(f"Invalid target term: {msg_t}")
+            st.error(f"Invalid desired target term: {msg_t}")
         else:
             st.session_state.terms.append(
                 {
                     "source_term": source_term.strip(),
                     "target_term": target_term.strip(),
+                    "current_target_term": current_target_term.strip(),
                     "description": description.strip(),
                 }
             )
@@ -413,8 +421,10 @@ def tab_terms() -> None:
     if st.session_state.terms:
         st.subheader("Current term list")
         for idx, t in enumerate(st.session_state.terms, start=1):
+            ct = t.get("current_target_term", "")
+            middle = f"`{ct}` → " if ct else ""
             st.markdown(
-                f"**{idx}.** `{t['source_term']}` → `{t['target_term']}`  "
+                f"**{idx}.** `{t['source_term']}` → {middle}`{t['target_term']}`  "
                 f"_{t.get('description', '') or 'No description'}_"
             )
 
@@ -630,6 +640,7 @@ def tab_process(api_key: str, force_mode: bool, model: Optional[str] = None) -> 
                 source_lang=source_lang,
                 target_lang=target_lang,
                 description=t.get("description", ""),
+                current_target_term=t.get("current_target_term", ""),
             )
             for idx, t in enumerate(st.session_state.terms, start=1)
         ]
@@ -725,10 +736,15 @@ def tab_results() -> None:
                 orig_tgt = getattr(r, "original_target", "")
                 new_tgt = getattr(r, "new_target", "")
 
+            # Use st.text for the content so placeholders like [$driver_name] are
+            # shown literally (st.markdown renders $...$ as LaTeX and mangles them).
             st.markdown(f"**Unit ID:** `{unit_id}`")
-            st.markdown(f"**Source:** {src}")
-            st.markdown(f"**Original target:** {orig_tgt}")
-            st.markdown(f"**New target:** {new_tgt}")
+            st.markdown("**Source:**")
+            st.text(src)
+            st.markdown("**Original target:**")
+            st.text(orig_tgt)
+            st.markdown("**New target:**")
+            st.text(new_tgt)
             st.markdown("---")
 
     # Download corrected file

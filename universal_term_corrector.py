@@ -311,11 +311,51 @@ def derive_surface_replacements(before: str, after: str) -> List[Tuple[str, str]
 
 
 def apply_surface_replacements(raw_target: str, pairs: List[Tuple[str, str]]) -> str:
-    """Apply target-side surface replacements to the raw target text."""
+    """Apply target-side surface replacements to the raw target text.
+
+    Longest source first so an inflected form (şoförün) is replaced before the
+    bare stem (şoför) and never half-replaced.
+    """
     out = raw_target
-    for old, new in pairs:
-        out = out.replace(old, new)
+    for old, new in sorted(pairs, key=lambda p: len(p[0]), reverse=True):
+        if old and new and old != new:
+            out = out.replace(old, new)
     return out
+
+
+def find_inflected_forms(text: str, stem: str) -> List[str]:
+    """Distinct whole-word tokens in `text` that contain `stem` (case-insensitive).
+
+    Used by the optional 3-term flow: given the term as it CURRENTLY appears in
+    the target (e.g. "şoför"), locate every inflected occurrence ("şoför",
+    "şoförün", "Şoförün", "şoförlerin", …) deterministically — no guessing which
+    target word corresponds to the source term.
+    """
+    if not stem:
+        return []
+    pattern = re.compile(r"\w*" + re.escape(stem) + r"\w*", re.IGNORECASE | re.UNICODE)
+    seen, forms = set(), []
+    for m in pattern.finditer(text):
+        word = m.group(0)
+        # Keep distinct EXACT casings ("şoförün" and "Şoförün" are both needed so
+        # each raw occurrence is replaced with a correctly-cased word).
+        if word and word not in seen:
+            seen.add(word)
+            forms.append(word)
+    return forms
+
+
+def match_case(src_form: str, new_form: str) -> str:
+    """Apply src_form's capitalization to new_form (deterministic case preservation)."""
+    if not new_form:
+        return new_form
+    if len(src_form) > 1 and src_form.isupper():
+        return new_form.upper()
+    if src_form[:1].isupper():
+        return new_form[:1].upper() + new_form[1:]
+    if src_form.islower():
+        return new_form.lower()
+    return new_form
 
 
 @dataclass
@@ -327,6 +367,7 @@ class TermCorrection:
     target_language: str
     description: str = ""
     term_id: int = 0
+    current_target_term: str = ""  # optional: the term as it CURRENTLY appears in the target
     morphological_group: Optional[str] = None
     grammatical_info: Optional[Dict] = None
     capitalization_pattern: str = "preserve"
@@ -879,6 +920,58 @@ Focus on providing the highest quality linguistic replacement possible."""
                 "error": str(e)
             }
     
+    def _map_inflected_forms(self, forms: List[str], current_target: str, desired_target: str,
+                             target_lang: str, logger: logging.Logger) -> Dict[str, str]:
+        """Map each inflected form of `current_target` to the equivalent inflected form of
+        `desired_target`, preserving grammatical form and capitalization. One AI call for
+        new forms; results cached across units. Language-agnostic (no hardcoded rules)."""
+        if not hasattr(self, "_form_map_cache"):
+            self._form_map_cache = {}
+        lang_name = self.get_language_name(target_lang)
+        # Map on the lowercased lexeme (one AI answer per form regardless of casing),
+        # then re-case per exact occurrence with match_case.
+        lower_to_exacts: Dict[str, List[str]] = {}
+        for f in forms:
+            lower_to_exacts.setdefault(f.lower(), []).append(f)
+
+        todo = [lf for lf in lower_to_exacts
+                if (current_target.lower(), desired_target.lower(), lf) not in self._form_map_cache]
+        if todo:
+            prompt = (
+                f'You are an expert {lang_name} morphologist. In {lang_name}, the term '
+                f'"{current_target}" is being replaced by "{desired_target}".\n'
+                f'For EACH inflected form below, output the equivalent inflected form of '
+                f'"{desired_target}" that carries the EXACT SAME grammatical form (same case, '
+                f'number, person, possessive, definiteness). Change ONLY the lexeme; never '
+                f'change grammatical form, person, number, or case.\n'
+                f'Forms: {json.dumps(todo, ensure_ascii=False)}\n'
+                f'Return ONLY a JSON object mapping each input form to its replacement.'
+            )
+            mapping: Dict[str, str] = {}
+            try:
+                response = self.client.messages.create(
+                    model=self.model, max_tokens=1000,
+                    system="You are a precise morphological transformer. Return only JSON.",
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                text = response.content[0].text.strip()
+                jm = re.search(r"\{[\s\S]*\}", text)
+                if jm:
+                    mapping = json.loads(jm.group(0))
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Form-map error: {e}")
+            for lf in todo:
+                rep = (mapping.get(lf) or "").strip().lower()
+                # Fall back to the original lexeme if the AI failed (keeps the file valid).
+                self._form_map_cache[(current_target.lower(), desired_target.lower(), lf)] = rep or lf
+
+        result: Dict[str, str] = {}
+        for lf, exacts in lower_to_exacts.items():
+            base = self._form_map_cache[(current_target.lower(), desired_target.lower(), lf)]
+            for exact in exacts:
+                result[exact] = match_case(exact, base)
+        return result
+
     def expert_linguistic_replacement(self, source_text: str, target_text: str,
                                     term_correction: TermCorrection, semantic_analysis: Dict) -> str:
         """FORCE MODE: Expert linguistic replacement with perfect grammar awareness"""
@@ -896,41 +989,19 @@ REQUIRED REPLACEMENT: "{term_correction.source_term}" → "{term_correction.targ
 LINGUISTIC CONTEXT:
 {json.dumps(semantic_analysis, indent=2, ensure_ascii=False)}
 
-EXPERT REPLACEMENT REQUIREMENTS:
+STRICT RULES (do not deviate):
+1. Change ONLY the single term. Keep the grammatical form of the word already in the
+   target — the SAME case, number, person, possessive and definiteness — and adapt only
+   the lexeme to "{term_correction.target_term}" ({target_lang_name}), applying correct
+   morphology (buffer consonants, vowel harmony) for the NEW stem. Do NOT change person or
+   number (e.g. a 2nd-person-singular possessive must stay 2nd-person-singular).
+2. Preserve capitalization EXACTLY as in the current target: do not lowercase sentence
+   beginnings, do not change the case of any word.
+3. Change NOTHING else — every other word, all punctuation, tags, and placeholders such as
+   [$driver_name] stay byte-identical. Never edit text inside [$...] placeholders.
+4. Do not rephrase, retranslate, or "improve" the sentence.
 
-1. PERFECT MORPHOLOGICAL ACCURACY:
-   - Apply correct grammatical case for {target_lang_name}
-   - Ensure perfect number agreement (singular/plural)
-   - Maintain gender agreement where applicable
-   - Use appropriate definiteness (articles, determiners)
-
-2. FLAWLESS SYNTACTIC COHERENCE:
-   - Preserve all syntactic relationships
-   - Maintain agreement with modifiers (adjectives, articles)
-   - Ensure perfect verb agreement if term is subject
-   - Handle prepositional requirements expertly
-
-3. SEMANTIC PERFECTION:
-   - Maintain exact meaning and context
-   - Preserve register and formality level
-   - Keep all cultural and domain-specific nuances
-   - Ensure completely natural fluency
-
-4. STYLE MASTERY:
-   - Apply intelligent capitalization handling
-   - Preserve all formatting and punctuation
-   - Maintain consistent terminology
-   - Keep original text structure perfectly
-
-5. PROFESSIONAL EXCELLENCE:
-   - Apply advanced {target_lang_name} grammar rules
-   - Ensure publication-quality accuracy
-   - Validate against professional translation standards
-   - Create completely natural, native-like output
-
-CRITICAL: Make the replacement with absolute linguistic perfection. Replace "{term_correction.source_term}" with the optimal form of "{term_correction.target_term}" while maintaining perfect grammar, meaning, and style.
-
-Return ONLY the corrected {target_lang_name} text with expert-level linguistic accuracy."""
+Return ONLY the full corrected {target_lang_name} target text, nothing else."""
 
         try:
             response = self.client.messages.create(
@@ -1088,6 +1159,40 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
             unit_surface_pairs: List[Tuple[str, str]] = []
             
             for term_correction in self.term_corrections:
+                current_target = getattr(term_correction, "current_target_term", "") or ""
+                if current_target:
+                    # --- Deterministic 3-term path: locate the CURRENT target term in
+                    # the target and swap only the lexeme, preserving grammatical form
+                    # and capitalization. Fixes wrong person/number/case drift. ---
+                    forms = find_inflected_forms(target_analysis, current_target)
+                    if not forms:
+                        continue
+                    self.processing_stats['instances_found'] += len(forms)
+                    if len(unit_corrections) == 0:
+                        self.processing_stats['units_with_terms'] += 1
+                    form_map = self._map_inflected_forms(
+                        forms, current_target, term_correction.target_term,
+                        term_correction.target_language, logger
+                    )
+                    pairs = [(f, rep) for f, rep in form_map.items() if rep and rep != f]
+                    if not pairs:
+                        continue
+                    unit_surface_pairs.extend(pairs)
+                    corrections_to_apply.append((current_target, term_correction.target_term))
+                    self.processing_stats['semantic_analyses'] += 1
+                    self.processing_stats['perfect_corrections'] += 1
+                    unit_corrections.append(f"{current_target} → {term_correction.target_term}")
+                    correction_results.append(CorrectionResult(
+                        unit_id=unit_id,
+                        source_text=source_analysis,
+                        original_target=target_analysis,
+                        new_target=apply_surface_replacements(target_analysis, unit_surface_pairs),
+                        applied_corrections=unit_corrections.copy(),
+                        semantic_analysis={"mode": "deterministic_form_map", "forms": form_map},
+                        quality_score=0.99, confidence=0.99, force_applied=True,
+                    ))
+                    continue
+
                 if self.find_advanced_term_matches(source_analysis, term_correction.source_term):
                     logger.info(f"🎯 FORCE MODE: Found '{term_correction.source_term}' in unit {unit_id}")
                     self.processing_stats['instances_found'] += 1
@@ -1162,12 +1267,16 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
                     new_target = target_match.group(0).replace(target_text, new_target_content)
                     new_trans_unit = trans_unit_content.replace(target_match.group(0), new_target)
                     
-                    # Replace in full content
+                    # Replace in full content. Count only when the file actually
+                    # changed — so identical/duplicate segments already handled by an
+                    # earlier .replace() don't inflate the count (fixes 13/9/5 mismatch).
                     if new_trans_unit != trans_unit_content:
+                        before = modified_content
                         modified_content = modified_content.replace(trans_unit_content, new_trans_unit)
-                        corrections_made += len(corrections_to_apply)
-                        self.processing_stats['corrections_forced'] += len(corrections_to_apply)
-                        
+                        if modified_content != before:
+                            corrections_made += 1
+                            self.processing_stats['corrections_forced'] += 1
+
                         for src, tgt in corrections_to_apply:
                             clean_src = clean_xml_for_analysis(src)
                             clean_tgt = clean_xml_for_analysis(tgt)
