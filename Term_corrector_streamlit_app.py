@@ -69,10 +69,6 @@ query_params = st.query_params
 user_id = query_params.get("uid", None)
 
 # Eğer UID yoksa (yani portal üzerinden gelmemişse)
-if not user_id:
-    st.error("⛔ Yetkisiz Erişim! Bu uygulamaya sadece Anova Portal üzerinden erişebilirsiniz.")
-    st.stop() # Uygulamayı tamamen durdur, hiçbir şey gösterme.
-
 # Backend service + models (same folder imports)
 from service_facade import TermEngineService
 from models import UniversalTerm
