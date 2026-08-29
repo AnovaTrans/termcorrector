@@ -416,7 +416,13 @@ class UniversalTermCorrectorForce:
             'format_detected': '',
             'sdl_metadata_preserved': 0,
             'memoq_metadata_preserved': 0,
-            'namespace_compatibility': True
+            'namespace_compatibility': True,
+            # Clear, unambiguous counts (segments = units, instances = word occurrences):
+            'segments_found': 0,
+            'instances_found_total': 0,
+            'segments_corrected': 0,
+            'instances_corrected': 0,
+            'unmapped_forms': [],  # forms located in the target but not corrected
         }
         
         # Extended language mappings for universal support
@@ -937,39 +943,56 @@ Focus on providing the highest quality linguistic replacement possible."""
         todo = [lf for lf in lower_to_exacts
                 if (current_target.lower(), desired_target.lower(), lf) not in self._form_map_cache]
         if todo:
-            prompt = (
-                f'You are an expert {lang_name} morphologist. In {lang_name}, the term '
-                f'"{current_target}" is being replaced by "{desired_target}".\n'
-                f'For EACH inflected form below, output the equivalent inflected form of '
-                f'"{desired_target}" that carries the EXACT SAME grammatical form (same case, '
-                f'number, person, possessive, definiteness). Change ONLY the lexeme; never '
-                f'change grammatical form, person, number, or case.\n'
-                f'Forms: {json.dumps(todo, ensure_ascii=False)}\n'
-                f'Return ONLY a JSON object mapping each input form to its replacement.'
-            )
-            mapping: Dict[str, str] = {}
-            try:
-                response = self.client.messages.create(
-                    model=self.model, max_tokens=1000,
-                    system="You are a precise morphological transformer. Return only JSON.",
-                    messages=[{"role": "user", "content": prompt}],
+            def _ask(items: List[str]) -> Dict[str, str]:
+                out: Dict[str, str] = {}
+                prompt = (
+                    f'You are an expert {lang_name} morphologist. In {lang_name}, the term '
+                    f'"{current_target}" is being replaced by "{desired_target}".\n'
+                    f'For EACH inflected form below, output the equivalent inflected form of '
+                    f'"{desired_target}" carrying the EXACT SAME grammatical form (same case, '
+                    f'number, person, possessive, definiteness). Change ONLY the lexeme; never '
+                    f'change grammatical form, person, number, or case. You MUST return an entry '
+                    f'for EVERY form (including rare cases like comitative or plural genitive).\n'
+                    f'Forms: {json.dumps(items, ensure_ascii=False)}\n'
+                    f'Return ONLY a JSON object mapping each input form to its replacement.'
                 )
-                text = response.content[0].text.strip()
-                jm = re.search(r"\{[\s\S]*\}", text)
-                if jm:
-                    mapping = json.loads(jm.group(0))
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Form-map error: {e}")
+                try:
+                    response = self.client.messages.create(
+                        model=self.model, max_tokens=1000,
+                        system="You are a precise morphological transformer. Return only JSON.",
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    jm = re.search(r"\{[\s\S]*\}", response.content[0].text.strip())
+                    if jm:
+                        raw = json.loads(jm.group(0))
+                        # Tolerant: normalise AI keys (strip+lower) so a casing/space
+                        # mismatch in the returned JSON never drops a form silently.
+                        norm = {str(k).strip().lower(): str(v).strip() for k, v in raw.items()}
+                        for it in items:
+                            v = norm.get(it.strip().lower(), "")
+                            if v:
+                                out[it] = v.lower()
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"Form-map error: {e}")
+                return out
+
+            mapped = _ask(todo)
+            missing = [lf for lf in todo if lf not in mapped]
+            if missing:  # one targeted retry for the rare forms the model skipped
+                mapped.update(_ask(missing))
             for lf in todo:
-                rep = (mapping.get(lf) or "").strip().lower()
-                # Fall back to the original lexeme if the AI failed (keeps the file valid).
-                self._form_map_cache[(current_target.lower(), desired_target.lower(), lf)] = rep or lf
+                rep = mapped.get(lf, "")
+                self._form_map_cache[(current_target.lower(), desired_target.lower(), lf)] = rep
+                if not rep:  # located in the target but could not be mapped — surface it
+                    self.processing_stats['unmapped_forms'].append(
+                        {"form": lf, "current": current_target, "desired": desired_target}
+                    )
 
         result: Dict[str, str] = {}
         for lf, exacts in lower_to_exacts.items():
             base = self._form_map_cache[(current_target.lower(), desired_target.lower(), lf)]
             for exact in exacts:
-                result[exact] = match_case(exact, base)
+                result[exact] = match_case(exact, base) if base else ""
         return result
 
     def expert_linguistic_replacement(self, source_text: str, target_text: str,
@@ -1157,6 +1180,7 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
             unit_semantic_analyses = []
             corrections_to_apply = []
             unit_surface_pairs: List[Tuple[str, str]] = []
+            unit_instances = 0  # term occurrences that will be corrected in this segment
             
             for term_correction in self.term_corrections:
                 current_target = getattr(term_correction, "current_target_term", "") or ""
@@ -1167,16 +1191,25 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
                     forms = find_inflected_forms(target_analysis, current_target)
                     if not forms:
                         continue
-                    self.processing_stats['instances_found'] += len(forms)
+                    # Instances = actual occurrences of the term in this segment's target.
+                    occ = len(re.findall(
+                        r"\w*" + re.escape(current_target) + r"\w*",
+                        target_analysis, re.IGNORECASE | re.UNICODE))
+                    self.processing_stats['instances_found'] += len(forms)  # legacy
+                    self.processing_stats['instances_found_total'] += occ
                     if len(unit_corrections) == 0:
                         self.processing_stats['units_with_terms'] += 1
+                        self.processing_stats['segments_found'] += 1
                     form_map = self._map_inflected_forms(
                         forms, current_target, term_correction.target_term,
                         term_correction.target_language, logger
                     )
                     pairs = [(f, rep) for f, rep in form_map.items() if rep and rep != f]
                     if not pairs:
+                        # Found but not mappable — recorded as unmapped; stays visible in
+                        # the segments-found vs segments-corrected gap.
                         continue
+                    unit_instances += occ
                     unit_surface_pairs.extend(pairs)
                     corrections_to_apply.append((current_target, term_correction.target_term))
                     self.processing_stats['semantic_analyses'] += 1
@@ -1196,9 +1229,11 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
                 if self.find_advanced_term_matches(source_analysis, term_correction.source_term):
                     logger.info(f"🎯 FORCE MODE: Found '{term_correction.source_term}' in unit {unit_id}")
                     self.processing_stats['instances_found'] += 1
-                    
+                    self.processing_stats['instances_found_total'] += 1
+
                     if len(unit_corrections) == 0:  # Only count unique units once
                         self.processing_stats['units_with_terms'] += 1
+                        self.processing_stats['segments_found'] += 1
                     
                     # FORCE MODE: Always proceed with correction
                     logger.info(f"🔧 FORCE MODE: Applying expert correction in unit {unit_id}")
@@ -1222,6 +1257,7 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
                     unit_surface_pairs.extend(
                         derive_surface_replacements(target_analysis, corrected_text)
                     )
+                    unit_instances += 1
                     
                     # Calculate quality metrics
                     quality_metrics = semantic_analysis.get("replacement_quality", {})
@@ -1276,6 +1312,8 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
                         if modified_content != before:
                             corrections_made += 1
                             self.processing_stats['corrections_forced'] += 1
+                            self.processing_stats['segments_corrected'] += 1
+                            self.processing_stats['instances_corrected'] += unit_instances
 
                         for src, tgt in corrections_to_apply:
                             clean_src = clean_xml_for_analysis(src)
@@ -1433,6 +1471,14 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
             },
             "format_detection": asdict(self.file_format_info) if self.file_format_info else {},
             "term_corrections": [asdict(term) for term in self.term_corrections],
+            # Clear, unambiguous counts (segments = units, instances = word occurrences).
+            "counts": {
+                "segments_found": self.processing_stats['segments_found'],
+                "instances_found": self.processing_stats['instances_found_total'],
+                "segments_corrected": self.processing_stats['segments_corrected'],
+                "instances_corrected": self.processing_stats['instances_corrected'],
+                "unmapped_forms": self.processing_stats['unmapped_forms'],
+            },
             "universal_statistics": self.processing_stats,
             "quality_metrics": {
                 "total_corrections": len(results),
@@ -1440,10 +1486,12 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
                 "average_confidence": round(avg_confidence, 3),
                 "quality_distribution": quality_distribution,
                 "force_success_rate": 1.0,  # Always 100% in force mode
-                "instances_found": self.processing_stats['instances_found'],
-                "corrections_forced": self.processing_stats['corrections_forced'],
-                "coverage_rate": round(self.processing_stats['corrections_forced'] / 
-                                     max(1, self.processing_stats['instances_found']), 3)
+                "segments_found": self.processing_stats['segments_found'],
+                "instances_found": self.processing_stats['instances_found_total'],
+                "segments_corrected": self.processing_stats['segments_corrected'],
+                "instances_corrected": self.processing_stats['instances_corrected'],
+                "coverage_rate": round(self.processing_stats['instances_corrected'] /
+                                       max(1, self.processing_stats['instances_found_total']), 3),
             },
             "detailed_results": [asdict(result) for result in results],
             "universal_features": {
