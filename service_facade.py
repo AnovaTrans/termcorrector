@@ -65,6 +65,7 @@ class TermEngineService:
         lang_pair: Optional[Tuple[str, str]] = None,
         progress_callbacks: Optional[Dict[str, Any]] = None,
         model: Optional[str] = None,  # UI-selected current model id
+        progress_cb: Optional[Any] = None,  # progress_cb(done:int, total:int)
     ) -> Dict[str, Any]:
         """
         Ana giriş noktası.
@@ -105,7 +106,7 @@ class TermEngineService:
                     ForceTermCorrection(**t.to_term_correction_payload()) for t in terms
                 ]
                 corrections_made, detailed_results = corrector.process_xliff_file(
-                    tmp_path, self.logger
+                    tmp_path, self.logger, progress_cb=progress_cb
                 )
             else:
                 # AI-evaluated (context-aware) → V8 engine; may skip changes it
@@ -124,8 +125,11 @@ class TermEngineService:
                 corrector.term_corrections = [
                     TermCorrection(**t.to_term_correction_payload()) for t in terms
                 ]
+                v8_cbs: Dict[str, Any] = {}
+                if progress_cb:
+                    v8_cbs = {"batches": progress_cb, "variants": progress_cb}
                 corrections_made, detailed_results = corrector.process_file_v8(
-                    tmp_path, self.logger
+                    tmp_path, self.logger, v8_cbs
                 )
 
             # Progress callback'i en azından iş bittiğinde %100 olarak set edelim
