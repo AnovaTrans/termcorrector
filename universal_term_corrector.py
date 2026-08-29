@@ -358,6 +358,19 @@ def match_case(src_form: str, new_form: str) -> str:
     return new_form
 
 
+def _response_text(response) -> str:
+    """Concatenate the text blocks of a Messages response, skipping thinking blocks.
+
+    Current models (Sonnet 5, Opus 4.7+, …) return a ThinkingBlock first, so
+    response.content[0].text raises "'ThinkingBlock' object has no attribute 'text'".
+    """
+    parts = []
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", "") == "text":
+            parts.append(getattr(block, "text", "") or "")
+    return "".join(parts).strip()
+
+
 @dataclass
 class TermCorrection:
     """Enhanced data class for term correction mappings with semantic analysis"""
@@ -880,7 +893,7 @@ Focus on providing the highest quality linguistic replacement possible."""
                 messages=[{"role": "user", "content": force_semantic_prompt}]
             )
             
-            content = response.content[0].text.strip()
+            content = _response_text(response)
             
             # Parse analysis
             try:
@@ -962,7 +975,7 @@ Focus on providing the highest quality linguistic replacement possible."""
                         system="You are a precise morphological transformer. Return only JSON.",
                         messages=[{"role": "user", "content": prompt}],
                     )
-                    jm = re.search(r"\{[\s\S]*\}", response.content[0].text.strip())
+                    jm = re.search(r"\{[\s\S]*\}", _response_text(response))
                     if jm:
                         raw = json.loads(jm.group(0))
                         # Tolerant: normalise AI keys (strip+lower) so a casing/space
@@ -1034,7 +1047,7 @@ Return ONLY the full corrected {target_lang_name} target text, nothing else."""
                 messages=[{"role": "user", "content": expert_replacement_prompt}]
             )
             
-            corrected_text = response.content[0].text.strip()
+            corrected_text = _response_text(response)
             
             # Clean up any AI formatting
             corrected_text = corrected_text.strip('"').strip("'").strip()

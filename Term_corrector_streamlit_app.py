@@ -806,17 +806,6 @@ def tab_results() -> None:
                 mime="application/xml",
             )
 
-    # Download JSON report if exists
-    if report_path and Path(report_path).exists():
-        with open(report_path, "rb") as f:
-            report_bytes = f.read()
-        st.download_button(
-            "⬇️ Download JSON report",
-            data=report_bytes,
-            file_name=Path(report_path).name,
-            mime="application/json",
-        )
-
 
 # ---------------------------------------------------------------------------
 # Main App
