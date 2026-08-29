@@ -18,6 +18,13 @@ try:
 except ImportError:  # fallback
     from ultimate_term_corrector_v8 import UltimateTermCorrectorV8, TermCorrection  # type: ignore
 
+# Robust, format-aware DOM engine (SDL/memoQ/XLIFF), validates XML before saving and
+# always enforces the terms. This is the original working engine; Forced mode uses it.
+from universal_term_corrector import (
+    UniversalTermCorrectorForce,
+    TermCorrection as ForceTermCorrection,
+)
+
 
 class TermEngineService:
     """
@@ -86,34 +93,38 @@ class TermEngineService:
 
             self.logger.info("Temp file created at %s", tmp_path)
 
-            # 2) Corrector örneği oluştur
+            # 2) Corrector örneği oluştur + işle (moda göre motor seç)
             force_mode = mode.lower() == "forced"
-            corrector = UltimateTermCorrectorV8(
-                api_key=self.api_key,
-                force_mode=force_mode,
-            )
 
-            # 3) Dil çifti verilmişse corrector içine set et (varsa alanı)
-            if lang_pair is not None:
-                src_lang, tgt_lang = lang_pair
-                if hasattr(corrector, "source_lang"):
-                    setattr(corrector, "source_lang", src_lang)
-                if hasattr(corrector, "target_lang"):
-                    setattr(corrector, "target_lang", tgt_lang)
-
-            # 4) UniversalTerm → TermCorrection listesi
-            term_corrections: List[TermCorrection] = []
-            for t in terms:
-                payload = t.to_term_correction_payload()
-                term_corrections.append(TermCorrection(**payload))
-            corrector.term_corrections = term_corrections  # type: ignore[attr-defined]
-
-            # 5) Ana işlem çağrısı
-            # ultimate_term_corrector_v8'de:
-            #   corrections_made, detailed_results = process_file_v8(file_path, logger)
-            corrections_made, detailed_results = corrector.process_file_v8(
-                tmp_path, self.logger
-            )
+            if force_mode:
+                # Forced → robust DOM engine: format-aware, always enforces, and
+                # process_xliff_file writes the corrected file back to tmp_path.
+                corrector = UniversalTermCorrectorForce(api_key=self.api_key)
+                corrector.term_corrections = [
+                    ForceTermCorrection(**t.to_term_correction_payload()) for t in terms
+                ]
+                corrections_made, detailed_results = corrector.process_xliff_file(
+                    tmp_path, self.logger
+                )
+            else:
+                # AI-evaluated (context-aware) → V8 engine; may skip changes it
+                # judges semantically wrong.
+                corrector = UltimateTermCorrectorV8(
+                    api_key=self.api_key,
+                    force_mode=False,
+                )
+                if lang_pair is not None:
+                    src_lang, tgt_lang = lang_pair
+                    if hasattr(corrector, "source_lang"):
+                        setattr(corrector, "source_lang", src_lang)
+                    if hasattr(corrector, "target_lang"):
+                        setattr(corrector, "target_lang", tgt_lang)
+                corrector.term_corrections = [
+                    TermCorrection(**t.to_term_correction_payload()) for t in terms
+                ]
+                corrections_made, detailed_results = corrector.process_file_v8(
+                    tmp_path, self.logger
+                )
 
             # Progress callback'i en azından iş bittiğinde %100 olarak set edelim
             if progress_callbacks and "overall" in progress_callbacks:
@@ -129,16 +140,20 @@ class TermEngineService:
             with open(tmp_path, "rb") as f:
                 corrected_bytes = f.read()
 
-            # 7) JSON rapor üretilebiliyorsa üret
+            # 7) JSON rapor üretilebiliyorsa üret (motor tipine göre)
             report_path: Optional[str] = None
-            if hasattr(corrector, "generate_comprehensive_report"):
-                try:
+            try:
+                if hasattr(corrector, "generate_comprehensive_report"):
                     report_path = corrector.generate_comprehensive_report(
                         detailed_results, tmp_path, self.logger
                     )
-                except Exception as e:
-                    self.logger.warning("Report generation failed: %s", e)
-                    report_path = None
+                elif hasattr(corrector, "save_universal_report"):
+                    report_path = corrector.save_universal_report(
+                        detailed_results, tmp_path, self.logger
+                    )
+            except Exception as e:
+                self.logger.warning("Report generation failed: %s", e)
+                report_path = None
 
             return {
                 "corrected_file_bytes": corrected_bytes,
