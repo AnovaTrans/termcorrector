@@ -161,12 +161,22 @@ class TermEngineService:
                 self.logger.warning("Report generation failed: %s", e)
                 report_path = None
 
+            stats = getattr(corrector, "processing_stats", {}) or {}
+            counts = {
+                "segments_found": stats.get("segments_found", 0),
+                "instances_found": stats.get("instances_found_total", stats.get("instances_found", 0)),
+                "segments_corrected": stats.get("segments_corrected", corrections_made),
+                "instances_corrected": stats.get("instances_corrected", corrections_made),
+                "unmapped_forms": stats.get("unmapped_forms", []),
+            }
+
             return {
                 "corrected_file_bytes": corrected_bytes,
                 "corrections_made": corrections_made,
                 "results": detailed_results,
                 "report_path": report_path,
                 "tmp_file_path": tmp_path,
+                "counts": counts,
             }
 
         finally:

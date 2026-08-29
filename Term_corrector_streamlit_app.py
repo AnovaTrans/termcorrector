@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import re
@@ -621,6 +622,10 @@ def tab_process(api_key: str, force_mode: bool, model: Optional[str] = None) -> 
     if st.button("🚀 Run Terminology Correction", disabled=running):
         st.session_state.tc_running = True
         st.session_state.tc_error = None
+        # Clear edits + editor widget state from any previous run.
+        st.session_state.tc_edits = {}
+        for _k in [k for k in st.session_state.keys() if str(k).startswith("edit_")]:
+            del st.session_state[_k]
         st.rerun()
 
     # Active run: the engine runs in a worker thread so the MAIN thread can
@@ -702,6 +707,36 @@ def tab_process(api_key: str, force_mode: bool, model: Optional[str] = None) -> 
             )
 
 
+def _result_fields(r: Any) -> Tuple[Any, str, str, str]:
+    """unit_id, source, original_target, new_target — dict or dataclass-like."""
+    if isinstance(r, Dict):
+        return (r.get("unit_id"), r.get("source_text", ""),
+                r.get("original_target", ""), r.get("new_target", ""))
+    return (getattr(r, "unit_id", None), getattr(r, "source_text", ""),
+            getattr(r, "original_target", ""), getattr(r, "new_target", ""))
+
+
+def apply_user_edits(file_bytes: bytes, edits: Dict[Any, str]) -> bytes:
+    """Write the user's edited New targets back into the XLIFF, re-escaping so tags,
+    entities and [$placeholders] stay valid. Segments are matched positionally (the
+    engine's unit_id is the Nth <trans-unit>), spliced last→first so offsets hold."""
+    text = file_bytes.decode("utf-8", "replace")
+    unit_pat = re.compile(r"<trans-unit[^>]*>.*?</trans-unit>", re.DOTALL)
+    tgt_pat = re.compile(r"(<target[^>]*>)(.*?)(</target>)", re.DOTALL)
+    matches = list(unit_pat.finditer(text))
+    for idx, um in reversed(list(enumerate(matches, 1))):
+        if idx in edits or str(idx) in edits:
+            new_clean = edits.get(idx, edits.get(str(idx), ""))
+            unit_text = um.group(0)
+            tm = tgt_pat.search(unit_text)
+            if tm:
+                escaped = html.escape(new_clean, quote=False)
+                new_unit = (unit_text[:tm.start()] + tm.group(1) + escaped
+                            + tm.group(3) + unit_text[tm.end():])
+                text = text[:um.start()] + new_unit + text[um.end():]
+    return text.encode("utf-8")
+
+
 def tab_results() -> None:
     st.header("4️⃣ Results & Download")
 
@@ -710,53 +745,66 @@ def tab_results() -> None:
         st.info("No results yet. Please process a file first.")
         return
 
-    corrections_made = result.get("corrections_made", 0)
     detailed_results = result.get("results") or []
-    report_path = result.get("report_path")
+    counts = result.get("counts") or {}
 
     st.subheader("Summary")
-    st.write(f"**Corrections made:** {corrections_made}")
-    st.write(f"**Units processed:** {len(detailed_results)}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Segments found", counts.get("segments_found", 0))
+    c2.metric("Instances found", counts.get("instances_found", 0))
+    c3.metric("Segments corrected", counts.get("segments_corrected", 0))
+    c4.metric("Instances corrected", counts.get("instances_corrected", 0))
 
-    # Preview a few results if available
+    unmapped = counts.get("unmapped_forms") or []
+    if unmapped:
+        stuck = sorted({u.get("form", "") for u in unmapped if isinstance(u, dict)})
+        st.warning(
+            "Found in the target but not auto-corrected: "
+            + ", ".join(f for f in stuck if f)
+            + " — you can fix these by hand below."
+        )
+
+    # Editable review of every corrected segment.
+    edits: Dict[Any, str] = st.session_state.setdefault("tc_edits", {})
     if detailed_results:
-        st.subheader("Sample of corrected units")
-        sample_size = min(5, len(detailed_results))
-
-        for r in detailed_results[:sample_size]:
-            # r can be dict or dataclass-like object
-            if isinstance(r, Dict):
-                unit_id = r.get("unit_id")
-                src = r.get("source_text", "")
-                orig_tgt = r.get("original_target", "")
-                new_tgt = r.get("new_target", "")
-            else:
-                unit_id = getattr(r, "unit_id", None)
-                src = getattr(r, "source_text", "")
-                orig_tgt = getattr(r, "original_target", "")
-                new_tgt = getattr(r, "new_target", "")
-
-            # Use st.text for the content so placeholders like [$driver_name] are
-            # shown literally (st.markdown renders $...$ as LaTeX and mangles them).
-            st.markdown(f"**Unit ID:** `{unit_id}`")
-            st.markdown("**Source:**")
+        st.subheader("Corrected segments (editable)")
+        st.caption(
+            "Edit a New target and press Enter to save it. Edited segments are "
+            "included when you Save & Download."
+        )
+        for i, r in enumerate(detailed_results):
+            unit_id, src, orig_tgt, new_tgt = _result_fields(r)
+            st.markdown(f"**Unit `{unit_id}`**")
+            st.markdown("Source:")
             st.text(src)
-            st.markdown("**Original target:**")
+            st.markdown("Original target:")
             st.text(orig_tgt)
-            st.markdown("**New target:**")
-            st.text(new_tgt)
+            edited = st.text_input("New target", value=new_tgt, key=f"edit_{i}_{unit_id}")
+            if edited != new_tgt:
+                edits[unit_id] = edited
+                st.caption("✏️ edited — will be saved on download")
+            else:
+                edits.pop(unit_id, None)  # reverted
             st.markdown("---")
 
-    # Download corrected file
+    # Download — becomes Save & Download once anything is edited.
     corrected_bytes = result.get("corrected_file_bytes")
     if corrected_bytes:
         out_name = st.session_state.file_name or "corrected_file.xlf"
-        st.download_button(
-            "⬇️ Download corrected file",
-            data=corrected_bytes,
-            file_name=f"corrected_{out_name}",
-            mime="application/xml",
-        )
+        if edits:
+            st.download_button(
+                "💾 Save & Download",
+                data=apply_user_edits(corrected_bytes, edits),
+                file_name=f"corrected_{out_name}",
+                mime="application/xml",
+            )
+        else:
+            st.download_button(
+                "⬇️ Download corrected file",
+                data=corrected_bytes,
+                file_name=f"corrected_{out_name}",
+                mime="application/xml",
+            )
 
     # Download JSON report if exists
     if report_path and Path(report_path).exists():
