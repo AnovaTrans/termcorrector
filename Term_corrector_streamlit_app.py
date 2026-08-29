@@ -73,6 +73,7 @@ user_id = query_params.get("uid", None)
 from service_facade import TermEngineService
 from models import UniversalTerm
 from derived_term_finder import find_derived_terms
+from model_utils import list_model_ids, default_model, FALLBACK_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +237,8 @@ def detect_term_conflicts(terms: List[Dict[str, Any]]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def sidebar_configuration() -> Tuple[str, bool]:
-    """Sidebar: API key + mode selection."""
+def sidebar_configuration() -> Tuple[str, bool, Optional[str]]:
+    """Sidebar: API key + live model selection + mode."""
     st.sidebar.title("⚙️ Configuration")
 
     # Prefer environment variable in production:
@@ -255,6 +256,26 @@ def sidebar_configuration() -> Tuple[str, bool]:
     if not api_key:
         st.sidebar.warning("Please provide an API key to run corrections.")
 
+    # --- Model selection, fetched live from the Models API ---
+    # Fetch once when a key is first available; a button forces a refresh.
+    model: Optional[str] = None
+    if api_key:
+        refresh = st.sidebar.button("🔄 Refresh model list")
+        if refresh or "model_ids" not in st.session_state:
+            with st.sidebar:
+                with st.spinner("Fetching current Claude models..."):
+                    st.session_state.model_ids = list_model_ids(api_key)
+        ids = st.session_state.get("model_ids") or FALLBACK_MODELS
+        if not st.session_state.get("model_ids"):
+            st.sidebar.caption("Live model list unavailable — showing current defaults.")
+        default = default_model(ids)
+        model = st.sidebar.selectbox(
+            "🤖 Model",
+            ids,
+            index=ids.index(default) if default in ids else 0,
+            help="Fetched live from your account. Use Refresh to update.",
+        )
+
     mode_label = st.sidebar.radio(
         "Correction Mode",
         ["AI-evaluated (context-aware)", "Forced (strict term enforcement)"],
@@ -267,7 +288,7 @@ def sidebar_configuration() -> Tuple[str, bool]:
     force_mode = mode_label.startswith("Forced")
     st.session_state.force_mode = force_mode
 
-    return api_key, force_mode
+    return api_key, force_mode, model
 
 
 def tab_upload_and_settings() -> None:
@@ -559,7 +580,7 @@ def tab_terms() -> None:
         st.info("No terms defined yet. Please add at least one term.")
 
 
-def tab_process(api_key: str, force_mode: bool) -> None:
+def tab_process(api_key: str, force_mode: bool, model: Optional[str] = None) -> None:
     st.header("3️⃣ Process File")
 
     if not api_key:
@@ -635,16 +656,24 @@ def tab_process(api_key: str, force_mode: bool) -> None:
                 mode=mode,
                 lang_pair=(source_lang, target_lang),
                 progress_callbacks=callbacks,
+                model=model,
             )
 
             st.session_state.last_result = result
             status_placeholder.success("Processing complete.")
             overall_progress.progress(100, text="Completed")
 
-            st.success(
-                f"Corrections made: {result['corrections_made']} "
-                f"(see 'Results' tab for details)."
-            )
+            made = result.get("corrections_made", 0)
+            if made > 0:
+                st.success(
+                    f"Corrections made: {made} (see 'Results' tab for details)."
+                )
+            else:
+                st.warning(
+                    "0 corrections were applied. Check that the source segments "
+                    "contain your terms and that the model/API key are valid. "
+                    "If this persists, open 'Manage app' → logs for the exact error."
+                )
 
         except Exception as e:
             status_placeholder.error("An error occurred during processing.")
@@ -735,7 +764,7 @@ def main() -> None:
         "Powered by LLMs, designed for CAT tool workflows."
     )
 
-    api_key, force_mode = sidebar_configuration()
+    api_key, force_mode, model = sidebar_configuration()
 
     tabs = st.tabs(
         [
@@ -751,7 +780,7 @@ def main() -> None:
     with tabs[1]:
         tab_terms()
     with tabs[2]:
-        tab_process(api_key, force_mode)
+        tab_process(api_key, force_mode, model)
     with tabs[3]:
         tab_results()
 
