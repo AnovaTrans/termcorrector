@@ -38,6 +38,16 @@ from pathlib import Path
 import shutil
 import tempfile
 
+def _response_text(response) -> str:
+    """Concatenate text blocks of a Messages response, skipping thinking blocks.
+    Current models return a ThinkingBlock first, so response.content[0].text fails."""
+    parts = []
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", "") == "text":
+            parts.append(getattr(block, "text", "") or "")
+    return "".join(parts).strip()
+
+
 # --- DATA CLASSES ---
 
 @dataclass
@@ -192,7 +202,7 @@ class BatchProcessor:
     def _process_single_batch(self, batch_segments: List[Dict], term_corrections: List[TermCorrection], client: anthropic.Anthropic, logger: logging.Logger) -> List[ProcessingResult]:
         batch_prompt = self._create_batch_prompt(batch_segments, term_corrections)
         response = self.model_system.resilient_api_call(client, max_tokens=4000, system="You are an expert multilingual term correction system.", messages=[{"role": "user", "content": batch_prompt}])
-        return self._parse_batch_response(response.content[0].text, batch_segments, logger)
+        return self._parse_batch_response(_response_text(response), batch_segments, logger)
         
     def _create_batch_prompt(self, segments: List[Dict], term_corrections: List[TermCorrection]) -> str:
         force_instruction = "\nCRITICAL DIRECTIVE: This is a FORCED REPLACEMENT task. You MUST replace the terms as requested, even if the existing translation seems correct." if self.force_mode else ""
@@ -255,7 +265,7 @@ class UltimateTermCorrectorV8:
         prompt = f"""Given the word in {lang_name}: "{term.source_term}", provide a JSON list of its common morphological variants (e.g., plural, definite). Include the original word. Example: ["house", "houses"]. Return ONLY the JSON list."""
         try:
             response = self.model_system.resilient_api_call(self.client, max_tokens=200, system="You are a linguistic expert.", messages=[{"role": "user", "content": prompt}])
-            json_match = re.search(r'\[[\s\S]*?\]', response.content[0].text)
+            json_match = re.search(r'\[[\s\S]*?\]', _response_text(response))
             if json_match:
                 variants = json.loads(json_match.group(0))
                 if isinstance(variants, list) and all(isinstance(v, str) for v in variants):
