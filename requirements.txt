@@ -1,0 +1,16 @@
+streamlit>=1.28.0
+anthropic>=0.25.0
+pandas>=1.5.0
+numpy>=1.24.0
+lxml>=4.9.0
+requests>=2.28.0
+python-dateutil>=2.8.0
+packaging>=21.0
+
+# Recommended additions
+python-dotenv>=1.0.0
+chardet>=5.2.0
+defusedxml>=0.7.1
+
+# Future (optional)
+spacy>=3.7.2
