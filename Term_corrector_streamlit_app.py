@@ -7,6 +7,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -604,81 +606,89 @@ def tab_process(api_key: str, force_mode: bool, model: Optional[str] = None) -> 
         f"({source_lang} → {target_lang})."
     )
 
-    # Progress elements
-    overall_progress = st.progress(0, text="Waiting to start...")
-    status_placeholder = st.empty()
+    # Run button — disabled while a run is in progress.
+    running = st.session_state.get("tc_running", False)
+    if st.button("🚀 Run Terminology Correction", disabled=running):
+        st.session_state.tc_running = True
+        st.session_state.tc_error = None
+        st.rerun()
 
-    def make_progress_callbacks() -> Dict[str, Any]:
-        """
-        Create callbacks compatible with TermEngineService/UltimateTermCorrectorV8.
-        We expect something like: callback(stage, done, total)
-        """
-
-        def overall_cb(stage: str, done: int, total: int) -> None:
-            if total <= 0:
-                return
-            ratio = done / total
-            percent = int(ratio * 100)
-            overall_progress.progress(percent, text=f"{stage}: {percent}%")
-
-        return {"overall": overall_cb}
-
-    callbacks = make_progress_callbacks()
-
-    if st.button("🚀 Run Terminology Correction"):
-        status_placeholder.info("Processing file, please wait...")
-        try:
-            service = TermEngineService(
-                provider="anthropic",
-                api_key=api_key,
-                logger=st.session_state.logger,
+    # Active run: the engine runs in a worker thread so the MAIN thread can
+    # animate a real progress bar. (Streamlit freezes the UI while a synchronous
+    # call runs, which is why the old bar never moved and it looked stuck.)
+    if st.session_state.get("tc_running"):
+        # Capture everything the worker needs on the main thread — a worker
+        # thread must not touch st.session_state (no ScriptRunContext).
+        file_bytes = st.session_state.file_bytes
+        file_name = st.session_state.file_name
+        logger = st.session_state.logger
+        universal_terms: List[UniversalTerm] = [
+            UniversalTerm.from_simple_pair(
+                idx=idx,
+                source_term=t.get("source_term", ""),
+                target_term=t.get("target_term", ""),
+                source_lang=source_lang,
+                target_lang=target_lang,
+                description=t.get("description", ""),
             )
+            for idx, t in enumerate(st.session_state.terms, start=1)
+        ]
+        mode = "forced" if force_mode else "ai_evaluated"
 
-            # Convert term dicts → UniversalTerm list
-            universal_terms: List[UniversalTerm] = []
-            for idx, t in enumerate(st.session_state.terms, start=1):
-                ut = UniversalTerm.from_simple_pair(
-                    idx=idx,
-                    source_term=t.get("source_term", ""),
-                    target_term=t.get("target_term", ""),
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    description=t.get("description", ""),
+        shared: Dict[str, Any] = {"done": 0, "total": 0, "result": None, "error": None}
+
+        def _worker() -> None:
+            try:
+                service = TermEngineService(
+                    provider="anthropic", api_key=api_key, logger=logger
                 )
-                universal_terms.append(ut)
+                shared["result"] = service.analyze_file(
+                    file_bytes=file_bytes,
+                    file_name=file_name,
+                    terms=universal_terms,
+                    mode=mode,
+                    lang_pair=(source_lang, target_lang),
+                    model=model,
+                    progress_cb=lambda done, total: shared.update(done=done, total=total),
+                )
+            except Exception as exc:  # noqa: BLE001
+                shared["error"] = str(exc)
 
-            mode = "forced" if force_mode else "ai_evaluated"
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
 
-            result = service.analyze_file(
-                file_bytes=st.session_state.file_bytes,
-                file_name=st.session_state.file_name,
-                terms=universal_terms,
-                mode=mode,
-                lang_pair=(source_lang, target_lang),
-                progress_callbacks=callbacks,
-                model=model,
-            )
-
-            st.session_state.last_result = result
-            status_placeholder.success("Processing complete.")
-            overall_progress.progress(100, text="Completed")
-
-            made = result.get("corrections_made", 0)
-            if made > 0:
-                st.success(
-                    f"Corrections made: {made} (see 'Results' tab for details)."
+        bar = st.progress(0.0, text="Starting…")
+        while worker.is_alive():
+            total = shared["total"] or 0
+            if total:
+                bar.progress(
+                    min(shared["done"] / total, 0.99),
+                    text=f"Processing… {shared['done']}/{total} segments",
                 )
             else:
-                st.warning(
-                    "0 corrections were applied. Check that the source segments "
-                    "contain your terms and that the model/API key are valid. "
-                    "If this persists, open 'Manage app' → logs for the exact error."
-                )
+                bar.progress(0.05, text="Preparing…")
+            time.sleep(0.25)
+        worker.join()
+        bar.progress(1.0, text="Completed")
 
-        except Exception as e:
-            status_placeholder.error("An error occurred during processing.")
-            st.error(str(e))
-            st.session_state.logger.exception("Error in processing")
+        st.session_state.last_result = shared["result"]
+        st.session_state.tc_error = shared["error"]
+        st.session_state.tc_running = False
+        st.rerun()
+
+    # Outcome of the last completed run.
+    if st.session_state.get("tc_error"):
+        st.error(f"An error occurred during processing: {st.session_state.tc_error}")
+    elif st.session_state.get("last_result"):
+        made = st.session_state.last_result.get("corrections_made", 0)
+        if made > 0:
+            st.success(f"Corrections made: {made} (see 'Results' tab for details).")
+        else:
+            st.warning(
+                "0 corrections were applied. Check that the source segments contain "
+                "your terms and that the model/API key are valid. If this persists, "
+                "open 'Manage app' → logs for the exact error."
+            )
 
 
 def tab_results() -> None:

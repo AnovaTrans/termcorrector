@@ -26,7 +26,7 @@ import re
 import json
 import xml.etree.ElementTree as ET
 import anthropic
-from typing import List, Dict, Tuple, Optional, Set, Union
+from typing import List, Dict, Tuple, Optional, Set, Union, Callable
 import argparse
 from getpass import getpass
 import logging
@@ -1005,7 +1005,7 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
         
         return False
     
-    def process_universal_xliff_force_mode(self, file_content: str, logger: logging.Logger) -> Tuple[str, int, List[CorrectionResult]]:
+    def process_universal_xliff_force_mode(self, file_content: str, logger: logging.Logger, progress_cb: Optional[Callable] = None) -> Tuple[str, int, List[CorrectionResult]]:
         """Universal XLIFF processing with format-specific handling and FORCE MODE"""
         logger.info("🚀 Starting Universal FORCE MODE intelligent processing...")
         logger.info(f"📋 Detected format: {self.file_format_info.format_type} v{self.file_format_info.version}")
@@ -1041,6 +1041,8 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
         
         # Process each translation unit
         for unit_id, trans_unit_content in enumerate(trans_units, 1):
+            if progress_cb:
+                progress_cb(unit_id, len(trans_units))
             source_match = re.search(source_pattern, trans_unit_content, re.DOTALL)
             target_match = re.search(target_pattern, trans_unit_content, re.DOTALL)
             
@@ -1260,7 +1262,7 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
             logger.error(traceback.format_exc())
             return False
     
-    def process_xliff_file(self, file_path: str, logger: logging.Logger) -> Tuple[int, List[CorrectionResult]]:
+    def process_xliff_file(self, file_path: str, logger: logging.Logger, progress_cb: Optional[Callable] = None) -> Tuple[int, List[CorrectionResult]]:
         """Process any supported bilingual file with universal format support"""
         logger.info(f"🚀 Processing file with Universal FORCE MODE: {file_path}")
         
@@ -1276,7 +1278,7 @@ Return ONLY the corrected {target_lang_name} text with expert-level linguistic a
             
             # Process with Universal FORCE MODE
             modified_content, corrections_made, results = self.process_universal_xliff_force_mode(
-                original_content, logger
+                original_content, logger, progress_cb=progress_cb
             )
             
             # Save if corrections were made
